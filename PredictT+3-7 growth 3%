@@ -1,0 +1,350 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    precision_score,
+    recall_score
+)
+
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+
+
+
+# =========================
+# 0) CONFIG
+# =========================
+INPUT_FILE = "20251227 feature engineer.xlsx"
+SHEET_NAME = "Merge1"
+OUTPUT_FILE = "model_output_20260102.xlsx"
+
+# Label horizon holdout (exclude last H rows from FINAL training)
+HOLDOUT_HORIZON_DAYS = 7  # set 3 or 7
+
+# --- Tuning ---
+TUNE_TRAIN_END_RATIO = 0.7
+TUNE_CV_SPLITS = 5
+N_ITER_SEARCH = 50
+TUNE_SCORING = "roc_auc"  # or "average_precision"
+
+# --- Walk-forward (large test windows) ---
+MIN_TRAIN_SIZE = 400
+TEST_SIZE = 60
+STEP_SIZE = 20
+
+# --- Overall precision/recall decision rules (OOS) ---
+TOP_PCT = 0.20
+THRESHOLD = 0.70
+MA_WINDOW = 5
+
+# --- Signal rules (your request) ---
+SIGNAL_TOP_PCT = 0.30  # top 30% final_score AND top 30% score_vs_ma5
+
+# Chart output
+CHART_PNG = "signal_chart.png"
+
+
+
+# =========================
+# 1b) DEFINE TRAINABLE REGION (exclude last H rows)
+# =========================
+N = len(df)
+train_end_idx = max(0, N - HOLDOUT_HORIZON_DAYS)
+
+X_train_full = X.iloc[:train_end_idx].copy()
+y_train_full = y.iloc[:train_end_idx].copy()
+
+X_all = X.copy()  # we predict for ALL rows (incl last H)
+
+df["is_live_prediction"] = 0
+if HOLDOUT_HORIZON_DAYS > 0:
+    df.loc[train_end_idx:, "is_live_prediction"] = 1
+
+print(f"Training rows for final model: {len(X_train_full)}")
+print(f"Live (unlabeled) rows held out: {len(df) - len(X_train_full)}")
+
+# =========================
+# 2) TUNE LIGHTGBM PARAMS (ON EARLY HISTORY ONLY)
+# =========================
+tune_pool_end = int(len(X_train_full) * TUNE_TRAIN_END_RATIO)
+X_tune = X_train_full.iloc[:tune_pool_end]
+y_tune = y_train_full.iloc[:tune_pool_end]
+
+base = lgb.LGBMClassifier(
+    objective="binary",
+    class_weight="balanced",
+    random_state=42,
+    n_jobs=-1
+)
+
+param_dist = {
+    "num_leaves": [15, 31, 63],
+    "min_child_samples": [50, 80, 120, 150],
+    "max_depth": [-1, 3, 5, 7],
+    "n_estimators": [200, 300, 500, 800, 1200],
+    "learning_rate": [0.01, 0.03, 0.05],
+    "subsample": [0.6, 0.7, 0.8, 0.9],
+    "colsample_bytree": [0.6, 0.7, 0.8, 0.9],
+    "reg_alpha": [0.0, 0.5, 1.0, 3.0],
+    "reg_lambda": [0.5, 1.0, 3.0, 10.0],
+}
+
+tscv = TimeSeriesSplit(n_splits=TUNE_CV_SPLITS)
+
+search = RandomizedSearchCV(
+    estimator=base,
+    param_distributions=param_dist,
+    n_iter=N_ITER_SEARCH,
+    scoring=TUNE_SCORING,
+    cv=tscv,
+    random_state=42,
+    verbose=1,
+    n_jobs=-1
+)
+
+search.fit(X_tune, y_tune)
+
+best_params = search.best_params_
+print("\nBest CV score:", search.best_score_)
+print("Best params:", best_params)
+
+BEST_MODEL_PARAMS = dict(
+    objective="binary",
+    class_weight="balanced",
+    random_state=42,
+    n_jobs=-1,
+    **best_params
+)
+
+# =========================
+# 3) WALK-FORWARD EVALUATION + COLLECT OOS PREDICTIONS
+# =========================
+def walk_forward_expanding(X, y, dates, min_train_size, test_size, step_size, model_params):
+    results = []
+    oos_records = []
+    fold = 1
+    train_end = min_train_size
+
+    while train_end + test_size <= len(X):
+        X_train = X.iloc[:train_end]
+        y_train = y.iloc[:train_end]
+        X_test  = X.iloc[train_end:train_end + test_size]
+        y_test  = y.iloc[train_end:train_end + test_size]
+        d_test  = dates.iloc[train_end:train_end + test_size]
+
+        model = lgb.LGBMClassifier(**model_params)
+        model.fit(X_train, y_train)
+
+        proba = model.predict_proba(X_test)[:, 1]
+
+        roc = np.nan
+        if len(np.unique(y_test)) == 2:
+            roc = roc_auc_score(y_test, proba)
+        pr = average_precision_score(y_test, proba)
+
+        results.append({
+            "fold": fold,
+            "train_end": dates.iloc[train_end - 1],
+            "test_start": d_test.iloc[0],
+            "test_end": d_test.iloc[-1],
+            "train_rows": int(train_end),
+            "test_rows": int(test_size),
+            "train_pos_rate": float(y_train.mean()),
+            "test_pos_rate": float(y_test.mean()),
+            "roc_auc": float(roc) if not pd.isna(roc) else np.nan,
+            "pr_auc": float(pr)
+        })
+
+        oos_records.append(pd.DataFrame({
+            "grass_date": d_test.values,
+            "y_true": y_test.values,
+            "proba": proba,
+            "fold": fold
+        }))
+
+        fold += 1
+        train_end += step_size
+
+    wf_df = pd.DataFrame(results)
+    oos_df = pd.concat(oos_records, ignore_index=True).sort_values("grass_date").reset_index(drop=True)
+    return wf_df, oos_df
+
+# Walk-forward only on trainable region
+min_train_for_wf = min(MIN_TRAIN_SIZE, max(1, len(X_train_full) - TEST_SIZE))
+wf, oos_df = walk_forward_expanding(
+    X_train_full, y_train_full, dates.iloc[:train_end_idx],
+    min_train_size=min_train_for_wf,
+    test_size=TEST_SIZE,
+    step_size=STEP_SIZE,
+    model_params=BEST_MODEL_PARAMS
+)
+
+print("\n=== Walk-forward summary ===")
+print(wf[["roc_auc", "pr_auc"]].describe())
+
+# =========================
+# 3b) OVERALL PRECISION / RECALL (BASELINE RULES) ON OOS ONLY
+# =========================
+cutoff_top = np.quantile(oos_df["proba"], 1 - TOP_PCT)
+oos_df["pred_top_pct"] = (oos_df["proba"] >= cutoff_top).astype(int)
+
+precision_top = precision_score(oos_df["y_true"], oos_df["pred_top_pct"], zero_division=0)
+recall_top = recall_score(oos_df["y_true"], oos_df["pred_top_pct"], zero_division=0)
+trade_rate_top = oos_df["pred_top_pct"].mean()
+
+oos_df["pred_threshold"] = (oos_df["proba"] >= THRESHOLD).astype(int)
+precision_thr = precision_score(oos_df["y_true"], oos_df["pred_threshold"], zero_division=0)
+recall_thr = recall_score(oos_df["y_true"], oos_df["pred_threshold"], zero_division=0)
+trade_rate_thr = oos_df["pred_threshold"].mean()
+
+overall_pr_table = pd.DataFrame([{
+    "rule": f"Top {int(TOP_PCT*100)}% (global cutoff)",
+    "cutoff_or_threshold": float(cutoff_top),
+    "precision": float(precision_top),
+    "recall": float(recall_top),
+    "trade_rate": float(trade_rate_top),
+    "oos_positive_rate": float(oos_df["y_true"].mean()),
+    "oos_rows": int(len(oos_df))
+},{
+    "rule": "Fixed threshold",
+    "cutoff_or_threshold": float(THRESHOLD),
+    "precision": float(precision_thr),
+    "recall": float(recall_thr),
+    "trade_rate": float(trade_rate_thr),
+    "oos_positive_rate": float(oos_df["y_true"].mean()),
+    "oos_rows": int(len(oos_df))
+}])
+
+# =========================
+# 3c) SCORE-SURGE FEATURES ON OOS + SURGE BACKTEST
+# =========================
+oos_df["score_ma5"] = oos_df["proba"].rolling(MA_WINDOW).mean()
+oos_df["score_vs_ma5"] = oos_df["proba"] - oos_df["score_ma5"]
+oos_df["score_delta_1"] = oos_df["proba"] - oos_df["proba"].shift(1)
+oos_df["score_delta_3"] = oos_df["proba"] - oos_df["proba"].shift(3)
+
+oos_df["ruleA_score_only"] = oos_df["pred_top_pct"]
+oos_df["ruleB_score_plus_surge"] = (
+    (oos_df["proba"] >= cutoff_top) &
+    (oos_df["score_vs_ma5"] > 0)
+).astype(int)
+
+def eval_rule(y_true, y_pred):
+    return {
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "trade_rate": float(np.mean(y_pred)),
+        "positive_rate": float(np.mean(y_true)),
+        "rows": int(len(y_true))
+    }
+
+valid_oos = oos_df.dropna(subset=["score_ma5"]).copy()
+surge_summary = pd.DataFrame([
+    {"rule": f"Rule A: Top {int(TOP_PCT*100)}% score only", **eval_rule(valid_oos["y_true"], valid_oos["ruleA_score_only"])},
+    {"rule": f"Rule B: Top {int(TOP_PCT*100)}% AND score_vs_ma{MA_WINDOW}>0", **eval_rule(valid_oos["y_true"], valid_oos["ruleB_score_plus_surge"])},
+])
+
+by_fold_rows = []
+for f, g in valid_oos.groupby("fold"):
+    by_fold_rows.append({"fold": int(f), "rule": "A_score_only", **eval_rule(g["y_true"], g["ruleA_score_only"])})
+    by_fold_rows.append({"fold": int(f), "rule": "B_score_plus_surge", **eval_rule(g["y_true"], g["ruleB_score_plus_surge"])})
+surge_by_fold = pd.DataFrame(by_fold_rows).sort_values(["fold", "rule"]).reset_index(drop=True)
+
+# =========================
+# 4) TRAIN FINAL MODEL (NO LEAKAGE): TRAIN ON ALL EXCEPT LAST H DAYS
+# =========================
+final_model = lgb.LGBMClassifier(**BEST_MODEL_PARAMS)
+final_model.fit(X_train_full, y_train_full)
+
+df["final_score"] = final_model.predict_proba(X_all)[:, 1]
+
+# Full-data monitoring features for Merge1
+df["final_score_ma5"] = df["final_score"].rolling(5).mean()
+df["score_vs_ma5"] = df["final_score"] - df["final_score_ma5"]
+
+# =========================
+# 4b) CREATE is_signal IN Merge1 (your logic)
+#     IMPORTANT: compute the thresholds using TRAINABLE REGION ONLY to avoid look-ahead.
+# =========================
+train_slice = df.iloc[:train_end_idx].copy()
+train_slice = train_slice.dropna(subset=["final_score", "score_vs_ma5"])
+
+score_cut = np.quantile(train_slice["final_score"], 1 - SIGNAL_TOP_PCT)
+surge_cut = np.quantile(train_slice["score_vs_ma5"], 1 - SIGNAL_TOP_PCT)
+
+df["is_signal"] = (
+    (df["final_score"] >= score_cut) &
+    (df["score_vs_ma5"] >= surge_cut)
+).astype(int)
+
+# Feature importance (gain) from final model
+importance_gain = pd.DataFrame({
+    "feature": X.columns,
+    "importance_gain": final_model.booster_.feature_importance(importance_type="gain")
+}).sort_values("importance_gain", ascending=False)
+
+
+# =========================
+# 6) CREATE COMBO CHART (grass_date, close, is_signal)
+#     - close = line (left axis)
+#     - is_signal = bars (right axis)
+# =========================
+if "Close" not in df.columns:
+    raise ValueError("Column 'Close' not found in Merge1 input. Please add it to the Excel sheet first.")
+
+plot_df = df[["grass_date", "Close", "is_signal"]].dropna(subset=["grass_date", "Close"]).copy()
+
+fig, ax1 = plt.subplots(figsize=(14, 6))
+ax1.plot(plot_df["grass_date"], plot_df["Close"])
+ax1.set_xlabel("grass_date")
+ax1.set_ylabel("Close")
+
+ax2 = ax1.twinx()
+ax2.bar(plot_df["grass_date"], plot_df["is_signal"], width=2)  # width can be adjusted
+ax2.set_ylabel("is_signal")
+
+plt.title("Close (line) + is_signal (bars)")
+plt.tight_layout()
+plt.savefig(CHART_PNG, dpi=150)
+plt.close(fig)
+
+
+# =========================
+# 7) EXPORT OUTPUT (NEW FILE) + EMBED CHART
+# =========================
+with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+    df.to_excel(writer, sheet_name="Merge1", index=False)
+    wf.to_excel(writer, sheet_name="walk_forward", index=False)
+    oos_df.to_excel(writer, sheet_name="oos_predictions", index=False)
+    overall_pr_table.to_excel(writer, sheet_name="overall_precision_recall", index=False)
+    surge_summary.to_excel(writer, sheet_name="surge_backtest_summary", index=False)
+    surge_by_fold.to_excel(writer, sheet_name="surge_backtest_by_fold", index=False)
+    importance_gain.to_excel(writer, sheet_name="feature_importance", index=False)
+
+# Embed chart into a new sheet
+wb = load_workbook(OUTPUT_FILE)
+if "signal_chart" in wb.sheetnames:
+    ws = wb["signal_chart"]
+else:
+    ws = wb.create_sheet("signal_chart")
+
+img = XLImage(CHART_PNG)
+ws.add_image(img, "A1")
+
+# Also write the thresholds used (so you can audit later)
+ws["A25"] = "Signal thresholds computed on trainable region only (avoid look-ahead)"
+ws["A26"] = "final_score cutoff (top 30%)"
+ws["B26"] = float(score_cut)
+ws["A27"] = "score_vs_ma5 cutoff (top 30%)"
+ws["B27"] = float(surge_cut)
+
+wb.save(OUTPUT_FILE)
+
+print("\nSaved:", OUTPUT_FILE)
+print("Chart saved and embedded:", CHART_PNG)
+
