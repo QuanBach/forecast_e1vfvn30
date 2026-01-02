@@ -297,7 +297,15 @@ importance_gain = pd.DataFrame({
 if "Close" not in df.columns:
     raise ValueError("Column 'Close' not found in Merge1 input. Please add it to the Excel sheet first.")
 
+
+
+
+# Keep only last 3 months to avoid overwhelming chart
+max_date = df["grass_date"].max()
+cutoff_date = max_date - pd.DateOffset(months=3)
+
 plot_df = df[["grass_date", "Close", "is_signal"]].dropna(subset=["grass_date", "Close"]).copy()
+plot_df = plot_df[plot_df["grass_date"] >= cutoff_date].copy()
 
 fig, ax1 = plt.subplots(figsize=(14, 6))
 ax1.plot(plot_df["grass_date"], plot_df["Close"])
@@ -347,4 +355,5 @@ wb.save(OUTPUT_FILE)
 
 print("\nSaved:", OUTPUT_FILE)
 print("Chart saved and embedded:", CHART_PNG)
+
 
